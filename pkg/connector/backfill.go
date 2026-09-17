@@ -381,8 +381,13 @@ func (wa *WhatsAppClient) createPortalsFromHistorySync(ctx context.Context) {
 		Int64("login_timestamp", loginTS.Unix()).
 		Msg("Creating portals from history sync")
 	rateLimitErrors := 0
+	// wg only counts events that are actually dispatched (a wg.Add(1) right
+	// before QueueRemoteEvent). The WaitGroup is deliberately NOT pre-filled
+	// with len(conversations): the loop below has several early-return paths
+	// (ctx cancellation, nil client, failed dispatch), and a pre-filled
+	// counter would never reach zero on those paths, making wg.Wait() in the
+	// watcher goroutine block forever.
 	var wg sync.WaitGroup
-	wg.Add(len(conversations))
 	for i := 0; i < len(conversations); i++ {
 		if ctx.Err() != nil {
 			log.Warn().Err(ctx.Err()).Msg("Context cancelled, stopping history sync portal creation")
@@ -393,11 +398,9 @@ func (wa *WhatsAppClient) createPortalsFromHistorySync(ctx context.Context) {
 		}
 		conv := conversations[i]
 		if conv.ChatJID == types.StatusBroadcastJID && !wa.Main.Config.EnableStatusBroadcast {
-			wg.Done()
 			continue
 		} else if conv.ChatJID == types.PSAJID || conv.ChatJID == types.LegacyPSAJID {
 			// We don't currently support new PSAs, so don't bother backfilling them either
-			wg.Done()
 			continue
 		}
 		// TODO can the chat info fetch be avoided entirely?
@@ -419,7 +422,6 @@ func (wa *WhatsAppClient) createPortalsFromHistorySync(ctx context.Context) {
 			if err != nil {
 				log.Err(err).Msg("Failed to delete conversation user is not in")
 			}
-			wg.Done()
 			continue
 		} else if errors.Is(err, whatsmeow.ErrIQRateOverLimit) {
 			rateLimitErrors++
@@ -436,9 +438,13 @@ func (wa *WhatsAppClient) createPortalsFromHistorySync(ctx context.Context) {
 			continue
 		} else if err != nil {
 			log.Err(err).Stringer("chat_jid", conv.ChatJID).Msg("Failed to get chat info")
-			wg.Done()
 			continue
 		}
+		// wg.Add(1) happens immediately before dispatch: each queued event is
+		// guaranteed exactly one wg.Done() (either via its PostHandleFunc, or
+		// here when QueueRemoteEvent fails), which is required for the
+		// watcher goroutine below to ever unblock.
+		wg.Add(1)
 		res := wa.UserLogin.QueueRemoteEvent(&simplevent.ChatResync{
 			EventMeta: simplevent.EventMeta{
 				Type: bridgev2.RemoteEventChatResync,
@@ -461,12 +467,19 @@ func (wa *WhatsAppClient) createPortalsFromHistorySync(ctx context.Context) {
 			LatestMessageTS: conv.LastMessageTimestamp,
 		})
 		if !res.Success {
+			// The event was never dispatched, so its PostHandleFunc (and thus
+			// wg.Done) will not run — balance the wg.Add(1) above to keep the
+			// watcher goroutine from blocking forever.
+			wg.Done()
 			log.Debug().Msg("Cancelling history sync portal creation loop")
 			return
 		}
 	}
 	log.Info().Int("conversation_count", len(conversations)).Msg("Finished creating portals from history sync")
 	go func() {
+		// wg.Wait() is safe here: the counter is balanced on every code path
+		// (including aborted runs), so this goroutine always finishes and its
+		// history-sync flag is reliably reset.
 		wg.Wait()
 		wa.UserLogin.Metadata.(*waid.UserLoginMetadata).HistorySyncPortalsNeedCreating = false
 		err = wa.UserLogin.Save(ctx)

@@ -136,7 +136,13 @@ func (wa *WhatsAppClient) sendMediaRequest(ctx context.Context, req *wadb.MediaR
 		req.Status = wadb.MediaBackfillRequestStatusRequestSkipped
 		return
 	}
-	err = wa.sendMediaRequestDirect(ctx, req.MessageID, req.MediaKey)
+	// The immediate-retry path launches this from a fire-and-forget goroutine
+	// carrying a context.WithoutCancel(ctx) context, so the network send below
+	// is additionally bounded by its own deadline: without it, a stuck
+	// connection would leak that goroutine for the lifetime of the client.
+	sendCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Minute)
+	defer cancel()
+	err = wa.sendMediaRequestDirect(sendCtx, req.MessageID, req.MediaKey)
 	if err != nil {
 		log.Err(err).Msg("Failed to send media retry request")
 		req.Status = wadb.MediaBackfillRequestStatusRequestFailed
